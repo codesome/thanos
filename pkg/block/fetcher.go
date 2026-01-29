@@ -319,6 +319,62 @@ func (f *ConcurrentLister) GetActiveAndPartialBlockIDs(ctx context.Context, acti
 	return partialBlocks, nil
 }
 
+// FlatLister lists block IDs by doing a top level iteration of the bucket
+// and sequentially checking if meta.json exists for each block.
+// Unlike ConcurrentLister which uses high concurrency, FlatLister processes
+// blocks one at a time to minimize the rate of S3 API calls.
+type FlatLister struct {
+	logger log.Logger
+	bkt    objstore.InstrumentedBucketReader
+}
+
+func NewFlatLister(logger log.Logger, bkt objstore.InstrumentedBucketReader) *FlatLister {
+	return &FlatLister{
+		logger: logger,
+		bkt:    bkt,
+	}
+}
+
+func (f *FlatLister) GetActiveAndPartialBlockIDs(ctx context.Context, activeBlocks chan<- ActiveBlockFetchData) (partialBlocks map[ulid.ULID]bool, err error) {
+	partialBlocks = make(map[ulid.ULID]bool)
+
+	// List top-level directories and check meta.json existence for each block sequentially.
+	if err = f.bkt.Iter(ctx, "", func(name string) error {
+		id, ok := IsBlockDir(name)
+		if !ok {
+			return nil
+		}
+
+		// Check if meta.json exists for this block
+		metaFile := path.Join(id.String(), MetaFilename)
+		ok, err := f.bkt.Exists(ctx, metaFile)
+		if err != nil {
+			return errors.Wrapf(err, "check meta.json exists for block %v", id)
+		}
+
+		if !ok {
+			// Block doesn't have meta.json, mark as partial
+			partialBlocks[id] = true
+			return nil
+		}
+
+		// Block has meta.json, send as active
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case activeBlocks <- ActiveBlockFetchData{
+			ULID:         id,
+			lastModified: time.Time{}, // Not available without extra API calls.
+		}:
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return partialBlocks, nil
+}
+
 type MetadataFetcher interface {
 	Fetch(ctx context.Context) (metas map[ulid.ULID]*metadata.Meta, partial map[ulid.ULID]error, err error)
 	UpdateOnChange(func([]metadata.Meta, error))

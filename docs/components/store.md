@@ -167,14 +167,17 @@ Flags:
       --sync-block-duration=15m  Repeat interval for syncing the blocks between
                                  local and remote view.
       --block-discovery-strategy="concurrent"
-                                 One of concurrent, recursive. When set to
+                                 One of concurrent, recursive, flat. When set to
                                  concurrent, stores will concurrently issue
                                  one call per directory to discover active
                                  blocks in the bucket. The recursive strategy
                                  iterates through all objects in the bucket,
                                  recursively traversing into each directory.
                                  This avoids N+1 calls at the expense of having
-                                 slower bucket iterations.
+                                 slower bucket iterations. The flat strategy
+                                 lists top-level block directories and checks
+                                 meta.json existence with lower concurrency (1)
+                                 to reduce API call rate for large buckets.
       --block-sync-concurrency=20
                                  Number of goroutines to use when constructing
                                  index-cache.json blocks from object storage.

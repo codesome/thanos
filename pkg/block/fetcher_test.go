@@ -1523,3 +1523,104 @@ func TestRecursiveLister_MetaJsonOrderIsIrrelevant(t *testing.T) {
 		t.Errorf("Block %s has meta.json but was incorrectly marked as partial", blockID)
 	}
 }
+
+func TestFlatLister_CorrectlyIdentifiesPartialBlocks(t *testing.T) {
+	ctx := context.Background()
+	bkt := objstore.NewInMemBucket()
+
+	// Create blocks - some with meta.json, some without
+	blockWithMeta := ULID(1)
+	blockWithoutMeta := ULID(2)
+
+	// Block 1: has meta.json
+	var meta metadata.Meta
+	meta.Version = 1
+	meta.ULID = blockWithMeta
+	var buf bytes.Buffer
+	testutil.Ok(t, json.NewEncoder(&buf).Encode(&meta))
+	testutil.Ok(t, bkt.Upload(ctx, path.Join(blockWithMeta.String(), MetaFilename), &buf))
+	testutil.Ok(t, bkt.Upload(ctx, path.Join(blockWithMeta.String(), "chunks", "000001"), bytes.NewBuffer([]byte("chunks"))))
+
+	// Block 2: no meta.json (partial block)
+	testutil.Ok(t, bkt.Upload(ctx, path.Join(blockWithoutMeta.String(), "chunks", "000001"), bytes.NewBuffer([]byte("chunks"))))
+	testutil.Ok(t, bkt.Upload(ctx, path.Join(blockWithoutMeta.String(), "index"), bytes.NewBuffer([]byte("index"))))
+
+	// Create a FlatLister
+	logger := log.NewNopLogger()
+	insBkt := objstore.WithNoopInstr(bkt)
+	lister := NewFlatLister(logger, insBkt)
+
+	// Get active and partial blocks
+	activeBlocksCh := make(chan ActiveBlockFetchData, 10)
+	partialBlocks, err := lister.GetActiveAndPartialBlockIDs(ctx, activeBlocksCh)
+	testutil.Ok(t, err)
+	close(activeBlocksCh)
+
+	// Drain the channel
+	var activeBlocks []ulid.ULID
+	for block := range activeBlocksCh {
+		activeBlocks = append(activeBlocks, block.ULID)
+	}
+
+	// FlatLister should return only blocks with meta.json as active
+	testutil.Equals(t, 1, len(activeBlocks))
+	testutil.Equals(t, blockWithMeta, activeBlocks[0])
+
+	// FlatLister should correctly mark blocks without meta.json as partial
+	testutil.Equals(t, 1, len(partialBlocks))
+	testutil.Assert(t, partialBlocks[blockWithoutMeta], "block without meta should be marked as partial")
+}
+
+func TestFlatLister_IntegrationWithBaseFetcher(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	bkt := objstore.NewInMemBucket()
+	dir := t.TempDir()
+
+	// Create blocks - some with meta.json, some without
+	blockWithMeta1 := ULID(1)
+	blockWithMeta2 := ULID(2)
+	blockWithoutMeta := ULID(3)
+
+	// Block 1: has meta.json
+	var meta metadata.Meta
+	meta.Version = 1
+	meta.ULID = blockWithMeta1
+	var buf bytes.Buffer
+	testutil.Ok(t, json.NewEncoder(&buf).Encode(&meta))
+	testutil.Ok(t, bkt.Upload(ctx, path.Join(blockWithMeta1.String(), MetaFilename), &buf))
+
+	// Block 2: has meta.json
+	meta.ULID = blockWithMeta2
+	buf.Reset()
+	testutil.Ok(t, json.NewEncoder(&buf).Encode(&meta))
+	testutil.Ok(t, bkt.Upload(ctx, path.Join(blockWithMeta2.String(), MetaFilename), &buf))
+
+	// Block 3: no meta.json (partial block)
+	testutil.Ok(t, bkt.Upload(ctx, path.Join(blockWithoutMeta.String(), "chunks", "000001"), bytes.NewBuffer([]byte("chunks"))))
+
+	// Create a FlatLister and BaseFetcher
+	logger := log.NewNopLogger()
+	insBkt := objstore.WithNoopInstr(bkt)
+	lister := NewFlatLister(logger, insBkt)
+
+	r := prometheus.NewRegistry()
+	baseFetcher, err := NewBaseFetcher(logger, 20, insBkt, lister, dir, r)
+	testutil.Ok(t, err)
+
+	fetcher := baseFetcher.NewMetaFetcher(r, nil, nil)
+
+	// Fetch metadata
+	metas, partial, err := fetcher.Fetch(ctx)
+	testutil.Ok(t, err)
+
+	// Should have 2 metas (blocks with meta.json)
+	testutil.Equals(t, 2, len(metas))
+	testutil.Assert(t, metas[blockWithMeta1] != nil, "block 1 should have meta")
+	testutil.Assert(t, metas[blockWithMeta2] != nil, "block 2 should have meta")
+
+	// Should have 1 partial block (block without meta.json)
+	testutil.Equals(t, 1, len(partial))
+	testutil.Assert(t, partial[blockWithoutMeta] != nil, "block 3 should be marked as partial")
+}

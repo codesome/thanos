@@ -64,6 +64,7 @@ type syncStrategy string
 const (
 	concurrentDiscovery syncStrategy = "concurrent"
 	recursiveDiscovery  syncStrategy = "recursive"
+	flatDiscovery       syncStrategy = "flat"
 )
 
 type storeConfig struct {
@@ -152,8 +153,8 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("sync-block-duration", "Repeat interval for syncing the blocks between local and remote view.").
 		Default("15m").DurationVar(&sc.syncInterval)
 
-	strategies := strings.Join([]string{string(concurrentDiscovery), string(recursiveDiscovery)}, ", ")
-	cmd.Flag("block-discovery-strategy", "One of "+strategies+". When set to concurrent, stores will concurrently issue one call per directory to discover active blocks in the bucket. The recursive strategy iterates through all objects in the bucket, recursively traversing into each directory. This avoids N+1 calls at the expense of having slower bucket iterations.").
+	strategies := strings.Join([]string{string(concurrentDiscovery), string(recursiveDiscovery), string(flatDiscovery)}, ", ")
+	cmd.Flag("block-discovery-strategy", "One of "+strategies+". When set to concurrent, stores will concurrently issue one call per directory to discover active blocks in the bucket. The recursive strategy iterates through all objects in the bucket, recursively traversing into each directory. This avoids N+1 calls at the expense of having slower bucket iterations. The flat strategy lists top-level block directories and checks meta.json existence with lower concurrency to reduce API call rate for large buckets.").
 		Default(string(concurrentDiscovery)).StringVar(&sc.blockListStrategy)
 
 	cmd.Flag("block-sync-concurrency", "Number of goroutines to use when constructing index-cache.json blocks from object storage. Must be equal or greater than 1.").
@@ -389,6 +390,8 @@ func runStore(
 		blockLister = block.NewConcurrentLister(logger, insBkt)
 	case recursiveDiscovery:
 		blockLister = block.NewRecursiveLister(logger, insBkt)
+	case flatDiscovery:
+		blockLister = block.NewFlatLister(logger, insBkt)
 	default:
 		return errors.Errorf("unknown sync strategy %s", conf.blockListStrategy)
 	}
